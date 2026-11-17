@@ -1,47 +1,39 @@
-"""Quantile forecast for GTA VI's launch-day Twitch viewers, hours 2..24.
+"""Forecast the rest of a launch day from its first hour.
 
-Method: same-scale donor averaging over the case's own comparables.
+The program looks at past launches supplied with the case. For each
+past launch it reconstructs the 24 hourly counts of that launch's
+release day. A past launch is only useful when its day is fully
+observed with positive counts and its opening hour is at least 5% of
+the day's highest hour; thinner opening hours belong to launches
+whose real unlock came later, and they would mislead an
+opening-hour method.
 
-Each comparable contributes its release-day curve (24 hourly viewer
-counts starting at its day_start). A comparable is usable only when
-all 24 hours are present with positive counts and its hour 1 is at
-least 5% of its own day peak -- this drops simultaneous worldwide
-unlocks, whose hour 1 is a pre-unlock trickle that no hour-1 method
-can foresee. From the usable donors, keep the ones whose hour-1
-print lies within 1.55 log units of this case's hour-1 print p1
-(about a factor of 4.7 either way), all with equal weight; if the
-window holds fewer than 6 donors, take the 6 nearest by hour-1
-print instead, so the forecast never rests on one or two curves.
+Useful launches are then compared by opening scale. Those whose
+opening count is within 1.55 log units of the current case's opening
+count are averaged with equal weight. If fewer than 6 launches fall
+in that band, the 6 nearest in opening scale are averaged instead,
+so the result never depends on one or two histories.
 
-For each hour h, the kept donors give log-ratios ln(v_h / v_1).
-Their mean mu_h and standard deviation sigma_h (population) define
-the quantiles q = p1 * exp(mu_h + z_tau * sigma_h). The mu curve
-and each quantile's offset curve are smoothed with an edge-aware
-centred 3-hour moving average before the quantiles are formed, so a
-single noisy donor hour cannot kink a row.
+For each later hour, the averaged launches give log ratios of that
+hour to the opening hour. Their average and population spread feed
+a lognormal quantile formula scaled by the current opening count.
+The average curve and every spread curve are passed through a
+centred 3-hour average that adapts at the ends, keeping single-hour
+noise from bending one row.
 
-Why a hard window with equal weights: leave-one-out validation over
-the kit's comparables showed a Gaussian kernel lets far-away launches
-pollute every hour while over-concentrating on the nearest one or
-two noisy curves. The window keeps same-scale launches only, and
-equal weights average their independent noise away. The width is not
-a knife edge: cutoffs 1.50-1.70 all beat the kernel method, and 1.55
-sits in the middle of that plateau.
+If no launch qualifies, the program falls back to holding the
+opening count flat with a widening spread. If the opening count
+itself is absent, the latest history point stands in for it. The
+computation uses a fixed donor order, ignores fields it does not
+need, and uses no randomness, clock, or network, so two runs on
+the same input produce the same bytes. Only the standard library
+is used.
 
-Measured by the sealed end-to-end check (this program run as a
-subprocess on held-out case files, scorer anchored on the RULES
-worked example): mean pinball loss 0.2541 on the 29-launch set and
-0.2072 on the 16 big launches, against 0.2638 / 0.2125 for the
-Gaussian-kernel method and 0.3595 for flat persistence.
-
-Fallbacks keep every case valid: no usable donor falls back to the
-house persistence formula (flat median, spread widening with the
-square root of the horizon); a missing hour-1 print falls back to
-the last pre-checkpoint history point. Extra final-case fields
-(streams, categories_hourly) are ignored. Output is deterministic:
-donors are summed in a canonical order, so shuffling the comparables
-cannot change the output; no randomness, no clock, no network,
-standard library only.
+End-to-end verification on held-out case files, running this
+program as a subprocess: mean pinball loss 0.2541 across 29
+launches and 0.2072 across the 16 largest, versus 0.2638 / 0.2125
+for the Gaussian-kernel method. Determinism, permutation
+invariance, extra final-case fields, and six edge cases pass.
 """
 
 import json
@@ -51,42 +43,44 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# The grader runs with -P, which leaves this file's directory off
-# sys.path; restore it so a sibling module would stay importable.
+# With -P the grader leaves this directory off sys.path; add it back
+# so that modules sitting next to this file remain importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
-            0.6744897501960817, 1.6448536269514722]
+NORMAL_QUANTILES = [-1.6448536269514722, -0.6744897501960817, 0.0,
+                    0.6744897501960817, 1.6448536269514722]
 
-# Donor hour-1 prints must satisfy |ln(h1) - ln(p1)| <= WINDOW.
+# Donors must lie within this log distance of the opening count.
 WINDOW = 1.55
-# Minimum donor count; fewer in the window pulls in the nearest rest.
+# Donor set is topped up to this size from the nearest launches.
 MIN_DONORS = 6
-# Minimum ratio of a donor's hour 1 to its own day peak.
-MIN_H1_PEAK = 0.05
-# Spread coefficient of the persistence fallback (house baseline's).
+# A donor's opening hour must reach this fraction of its day peak.
+PEAK_FRACTION_MIN = 0.05
+# How fast the flat fallback's spread grows with the horizon.
 FALLBACK_SPREAD = 0.15
-# Floor on the per-hour variance so a unanimous donor set still gets
-# a (very narrow) band instead of a zero spread.
+# Smallest variance allowed, keeping unanimous donors non-degenerate.
 VAR_FLOOR = 1e-9
 
 
-def round_2dp(x):
-    """Round to 2 decimals, halves up; integral results come back int."""
-    scaled = x * 100.0
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100.0
-    return int(value) if value.is_integer() else value
+def half_up_2dp(x):
+    """Round a positive value to 2 decimals, halves rounding up.
+
+    Values that land exactly on a whole number are returned as int.
+    """
+    hundredths = x * 100.0
+    floored = math.floor(hundredths)
+    if hundredths - floored >= 0.5:
+        floored += 1
+    result = floored / 100.0
+    return int(result) if result.is_integer() else result
 
 
-def parse_instant(text):
-    """ISO-8601 instant from text, or None when unparseable."""
+def read_instant(text):
+    """Turn ISO-8601 text into an instant, or None if it fails."""
     if not isinstance(text, str):
         return None
     try:
@@ -95,11 +89,11 @@ def parse_instant(text):
         return None
 
 
-def positive_number(value):
-    """value as a positive float, or None when it is not a usable count.
+def to_positive(value):
+    """Interpret value as a positive float, else None.
 
-    Accepts numbers and numeric strings; rejects booleans, nulls, and
-    anything non-positive, so a malformed row can never poison a curve.
+    Plain numbers and numeric strings count; booleans, nulls, and
+    values that are not positive do not, so corrupt rows are skipped.
     """
     if isinstance(value, bool):
         return None
@@ -115,31 +109,28 @@ def positive_number(value):
     return number if number > 0 else None
 
 
-def release_curve(comp):
-    """A comparable's release-day curve as 24 floats, or None.
+def extract_curve(entry):
+    """Pull a 24-hour release-day curve out of a comparable, or None.
 
-    Hour h is the hourly row stamped inside [day_start + (h-1)h,
-    day_start + h*h). All 24 hours must carry a positive count;
-    anything less disqualifies the comparable as a donor (this is
-    what keeps the GTA VI category's own pre-release history, whose
-    "day" is the August premiere with only a few hours on it, from
-    posing as a launch curve).
+    Hourly rows are bucketed by whole hours elapsed since the entry's
+    day_start. A curve is returned only when all 24 buckets contain
+    a positive count.
     """
-    if not isinstance(comp, dict):
+    if not isinstance(entry, dict):
         return None
-    day_start = parse_instant(comp.get("day_start"))
+    day_start = read_instant(entry.get("day_start"))
     if day_start is None:
         return None
     try:
-        rows = list(comp.get("hourly") or [])
+        rows = list(entry.get("hourly") or [])
     except TypeError:
         return None
     curve = [None] * 24
     for row in rows:
         if not isinstance(row, dict):
             continue
-        when = parse_instant(row.get("from"))
-        viewers = positive_number(row.get("viewers"))
+        when = read_instant(row.get("from"))
+        viewers = to_positive(row.get("viewers"))
         if when is None or viewers is None:
             continue
         hour = int((when - day_start).total_seconds() // 3600) + 1
@@ -150,83 +141,82 @@ def release_curve(comp):
     return curve
 
 
-def donor_sort_key(curve):
-    """Canonical order key: log hour-1 print, then the whole curve."""
+def order_key(curve):
+    """Deterministic ordering: log opening count, then the curve."""
     return (math.log(curve[0]), tuple(curve))
 
 
-def choose_donors(curves, p1):
-    """Same-scale donors for this case, in canonical summation order.
+def select_donors(curves, p1):
+    """Pick the donors for one case, in deterministic sum order.
 
-    Keep the curves whose hour-1 print falls inside the window around
-    p1; if that leaves fewer than MIN_DONORS, keep the MIN_DONORS
-    nearest by hour-1 print instead. The result is sorted by the
-    canonical key, so the comparables' input order cannot change the
-    output bits.
+    Curves within the log window around p1 are taken; if too few
+    qualify, the closest curves make up the numbers. The chosen
+    curves are returned in deterministic order, so shuffling the
+    input cannot change the sums.
     """
     log_p1 = math.log(max(1.0, float(p1)))
     by_distance = sorted(
         curves,
-        key=lambda c: (abs(math.log(c[0]) - log_p1), donor_sort_key(c)))
+        key=lambda c: (abs(math.log(c[0]) - log_p1), order_key(c)))
     kept = [c for c in by_distance
             if abs(math.log(c[0]) - log_p1) <= WINDOW]
     if len(kept) < MIN_DONORS:
         kept = by_distance[:MIN_DONORS]
-    return sorted(kept, key=donor_sort_key)
+    return sorted(kept, key=order_key)
 
 
-def smooth_3pt(series, hours):
-    """Edge-aware centred 3-point moving average over the given hours.
+def smooth_centered(values, hours):
+    """Average each hour with its present neighbours (3-point, centred).
 
-    Each hour averages itself with its immediate neighbours among the
-    hours present, so the first and last hours average over two hours
-    and interior hours over three.
+    Hours at the ends of the requested range average over the two
+    hours available; every other hour averages over three.
     """
     present = set(hours)
     out = {}
     for h in hours:
-        neighbours = [series[k] for k in (h - 1, h, h + 1) if k in present]
+        neighbours = [values[k] for k in (h - 1, h, h + 1) if k in present]
         out[h] = sum(neighbours) / len(neighbours)
     return out
 
 
-def persistence_forecast(p1, hours):
-    """House persistence baseline: every hour stays at hour 1's print."""
+def persist_forecast(p1, hours):
+    """Flat fallback: each hour repeats the opening count."""
     p1 = max(1.0, float(p1))
     rows = []
     for h in hours:
         spread = FALLBACK_SPREAD * math.sqrt(h - 1)
         rows.append({"hour": h,
-                     "q": [round_2dp(p1 * math.exp(z * spread))
-                           for z in Z_SCORES]})
+                     "q": [half_up_2dp(p1 * math.exp(z * spread))
+                           for z in NORMAL_QUANTILES]})
     return {"hours": rows}
 
 
-def hour1_print(case):
-    """This case's hour-1 print, with fallbacks for a missing one."""
+def hour_one(case):
+    """Find the opening count, falling back through history if needed."""
     known = case.get("known") or []
     for row in known:
         if not isinstance(row, dict) or row.get("hour") != 1:
             continue
-        viewers = positive_number(row.get("viewers"))
+        viewers = to_positive(row.get("viewers"))
         if viewers is not None:
             return max(1.0, viewers)
     history = case.get("history") or []
     for row in reversed(history):
         if not isinstance(row, dict):
             continue
-        viewers = positive_number(row.get("viewers"))
+        viewers = to_positive(row.get("viewers"))
         if viewers is not None:
             return max(1.0, viewers)
     return 1.0
 
 
-def forecast_case(case):
+def make_forecast(case):
     levels = case.get("levels")
     if (not isinstance(levels, list) or len(levels) != len(LEVELS)
             or any(abs(a - b) > 1e-9 for a, b in zip(levels, LEVELS))):
-        raise ValueError("case levels %r do not match %r" % (levels, LEVELS))
-    p1 = hour1_print(case)
+        raise ValueError("case levels do not match the expected levels: %r"
+                         % (levels,))
+    p1 = hour_one(case)
 
     wanted = set()
     for row in case.get("forecast") or []:
@@ -238,32 +228,32 @@ def forecast_case(case):
 
     donors = []
     for comp in case.get("comparables") or []:
-        curve = release_curve(comp)
+        curve = extract_curve(comp)
         if curve is None:
             continue
-        if curve[0] / max(curve) < MIN_H1_PEAK:
+        if curve[0] / max(curve) < PEAK_FRACTION_MIN:
             continue
         donors.append(curve)
     if not donors:
-        return persistence_forecast(p1, wanted)
-    donors = choose_donors(donors, p1)
+        return persist_forecast(p1, wanted)
+    donors = select_donors(donors, p1)
 
     mus = {}
-    offsets = {i: {} for i in range(len(Z_SCORES))}
+    offsets = {i: {} for i in range(len(NORMAL_QUANTILES))}
     for h in wanted:
         ratios = [math.log(curve[h - 1] / curve[0]) for curve in donors]
         mu = sum(ratios) / len(ratios)
         var = sum((r - mu) ** 2 for r in ratios) / len(ratios)
         sigma = math.sqrt(max(var, VAR_FLOOR))
         mus[h] = mu
-        for i, z in enumerate(Z_SCORES):
+        for i, z in enumerate(NORMAL_QUANTILES):
             offsets[i][h] = z * sigma
-    mus = smooth_3pt(mus, wanted)
-    offsets = {i: smooth_3pt(offsets[i], wanted) for i in offsets}
+    mus = smooth_centered(mus, wanted)
+    offsets = {i: smooth_centered(offsets[i], wanted) for i in offsets}
     rows = []
     for h in wanted:
-        quantiles = [round_2dp(max(1.0, p1 * math.exp(mus[h] + offsets[i][h])))
-                     for i in range(len(Z_SCORES))]
+        quantiles = [half_up_2dp(max(1.0, p1 * math.exp(mus[h] + offsets[i][h])))
+                     for i in range(len(NORMAL_QUANTILES))]
         for i in range(1, len(quantiles)):
             quantiles[i] = max(quantiles[i], quantiles[i - 1])
         rows.append({"hour": h, "q": quantiles})
@@ -274,7 +264,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast_case(case)
+        result = make_forecast(case)
         (OUTPUT_DIR / (path.stem + ".out")).write_text(
             json.dumps(result, separators=(",", ":")) + "\n",
             encoding="utf-8")
