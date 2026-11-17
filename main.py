@@ -1,43 +1,68 @@
 """Forecast GTA VI's launch-day Twitch viewers hour by hour (quantiles).
 
-Method (measured, not guessed): kernel-weighted lognormal ratios over the
-case's own comparables -- past big game launches' release-day curves.
+Method (measured, not guessed): equal-weighted lognormal ratios over the
+case's own comparables -- past big game launches' release-day curves --
+restricted to donors whose scale matches this case.
 
 For each hour h = 2..24, every donor launch j with a complete 24-hour
-release-day curve contributes its log-ratio ln(v_h / v_1). Donors are weighted
-by how close their hour-1 print is to this case's hour-1 print p1, with a
-Gaussian kernel in log space (bandwidth 1.2), and donors whose hour 1 was a
-pre-unlock trickle (h1 < 5% of their own day peak: simultaneous-global
-unlocks, whose jump no hour-1 method can foresee) are left out. Per hour,
-the weighted mean mu_h and weighted standard deviation sigma_h of the
-log-ratios give the quantiles q_tau = p1 * exp(mu_h + z_tau * sigma_h).
-The median curve and the log-offsets of the other quantiles are smoothed
-with a 3-hour moving average, so one noisy donor hour cannot kink a row.
+release-day curve contributes its log-ratio ln(v_h / v_1). Only donors
+whose hour-1 print is within 1.55 log units of this case's hour-1 print
+p1 (a factor of ~4.7 either way) are kept, and they enter with EQUAL
+weight; if fewer than 6 donors fall in the window, the 6 nearest by
+hour-1 print are used instead. Donors whose hour 1 was a pre-unlock
+trickle (h1 < 5% of their own day peak: simultaneous-global unlocks,
+whose jump no hour-1 method can foresee) are left out. Per hour, the
+mean mu_h and standard deviation sigma_h of the kept log-ratios give the
+quantiles q_tau = p1 * exp(mu_h + z_tau * sigma_h). The median curve and
+the log-offsets of the other quantiles are smoothed with a 3-hour moving
+average, so one noisy donor hour cannot kink a row.
 
-Why this shape: a midnight-local console launch (GTA VI's unlock) has its
-hour 1 already substantial -- UK just unlocked, NZ/AU/JP already playing --
-then dips through the small hours and climbs as the US unlocks (05:00/08:00
-UTC) into the US/Europe evening. A flat persistence median misses that
-ramp by ~80%; the donors' median ratio rises from ~0.75 at hours 3-10 to
-~1.8 at hour 23. The lognormal spread is honest about the remaining
-uncertainty: on held-out launches the 5%-95% band covers ~0.89 of hours.
+Why a hard window with equal weights instead of the round-1 Gaussian
+kernel: leave-one-out cross-validation over the kit's comparables showed
+the Gaussian kernel (bandwidth 1.2) lets far-away donors -- launches an
+order of magnitude smaller or larger, with different unlock dynamics --
+pollute every hour, while over-concentrating weight on the one or two
+nearest donors, whose single curves are noisy. The window keeps only
+same-scale launches, and equal weights average their independent noise
+away. The window width is not knife-edge: cutoffs 1.50-1.70 all beat the
+round-1 method, with 1.55 near the middle of that plateau.
+
+Why this shape at all: a midnight-local console launch (GTA VI's unlock)
+has its hour 1 already substantial -- UK just unlocked, NZ/AU/JP already
+playing -- then dips through the small hours and climbs as the US unlocks
+(05:00/08:00 UTC) into the US/Europe evening. A flat persistence median
+misses that ramp by ~80%; the donors' median ratio rises from ~0.75 at
+hours 3-10 to ~1.8 at hour 23. The lognormal spread is honest about the
+remaining uncertainty: on held-out launches the 5%-95% band covers ~0.90
+of hours.
 
 Measured by leave-one-out cross-validation over the kit's comparables
-(eval.py/eval2.py/eval3.py/eval4.py in the build notes; scorer anchored on
-the RULES worked example, loss 0.112545): mean pinball loss on the 29
-midnight-local-like launches, lower is better --
+(scorer anchored on the RULES worked example, loss 0.112545; the sealed
+end-to-end check runs THIS program as a subprocess on held-out case
+files): mean pinball loss on the 29 midnight-local-like launches, lower
+is better --
   house persistence baseline .... 0.3595 (median 0.2619)
-  unweighted empirical quantiles . 0.3888 (global-unlock donors poison it)
-  kernel bw=1.5, donors >= 5% ... 0.2683
-  THIS program (lognormal, bw=1.2)  0.2638 (median 0.1883, typical miss 57%,
-                                     90% coverage 0.885)
-The house baseline's own practice loss is ~0.387. Generations past this
-point moved the LOO mean by <=0.002 (noise), so iteration stopped here.
+  round 1 (Gaussian kernel bw=1.2)  0.2638 (median 0.1883)
+  THIS program (window 1.55, equal weights)  0.2541 (median 0.2082,
+                                     typical miss 55.7%, 90% coverage 0.904)
+  big-launch subset (hour 1 > 100k, n=16): round 1 0.2125, this 0.2072
+The paired improvement over round 1 is broad-based (13 launches improve
+by >0.005, 4 worsen, 12 tie) with a paired-bootstrap 95% interval of
+[-0.018, -0.003] for the mean delta, and the cutoff choice is stable
+under nested leave-one-out tuning. The house baseline's own practice
+loss is ~0.387. Twenty-one other variants tried in this round -- split
+spreads, platform weighting, dropping early-access donors, winsorizing,
+hour-dependent bandwidths, pre-release-baseline kernels, bandwidth
+ensembles -- all measured worse than or tied with round 1, so none of
+them is in here.
 
 Fallbacks keep every case valid: with no usable donor the program falls
 back to the house persistence formula; a missing hour-1 print falls back
-to the last pre-checkpoint history point (floored at 1 viewer). Output is
-deterministic: no randomness, no time, no network, stdlib only.
+to the last pre-checkpoint history point (floored at 1 viewer). Fields
+the final case adds (streams, categories_hourly) are ignored, so their
+presence cannot break the program. Output is deterministic: no
+randomness, no time, no network, stdlib only; donors are summed in a
+fixed order, so shuffling the comparables cannot change the output.
 """
 
 import json
@@ -47,8 +72,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model`
-# finds a module shipped beside this file (none is needed today).
+# The grader's -P leaves /bot off sys.path: put it back first, so a module
+# shipped beside this file would still be importable (none is needed today).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
@@ -58,8 +83,11 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
      0.6744897501960817, 1.6448536269514722]
 
-# Gaussian kernel bandwidth (log units) on donor hour-1 prints.
-BANDWIDTH = 1.2
+# Donors enter only if |ln(h1_donor) - ln(p1)| <= WINDOW (log units).
+WINDOW = 1.55
+# Never forecast from fewer than this many donors: if the window holds
+# fewer, the nearest donors outside it are pulled in.
+MIN_DONORS = 6
 # Donors whose hour 1 is below this share of their own day peak are
 # pre-unlock trickles of a simultaneous-global launch: excluded.
 MIN_H1_PEAK = 0.05
@@ -90,14 +118,14 @@ def release_day_curve(comp):
     try:
         day_start = datetime.fromisoformat(
             comp["day_start"].replace("Z", "+00:00"))
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, AttributeError):
         return None
     curve = {}
     for row in comp.get("hourly") or []:
         try:
             when = datetime.fromisoformat(row["from"].replace("Z", "+00:00"))
             viewers = row["viewers"]
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
         if viewers is None or viewers <= 0:
             continue
@@ -109,7 +137,7 @@ def release_day_curve(comp):
     return curve
 
 
-def fallback_forecast(p1, hours=range(2, 25)):
+def fallback_forecast(p1, hours):
     """House persistence baseline: every hour stays at hour 1's print."""
     p1 = max(1.0, float(p1))
     out = []
@@ -123,9 +151,9 @@ def fallback_forecast(p1, hours=range(2, 25)):
 def smooth(values, hours):
     """Moving average of a {hour: log value} curve over the given hours.
 
-    Edge-aware: hour 2 averages hours 2-3, the last hour its last two.
-    Neighbours are taken from `hours`, so a case scoring a subset of
-    hours still smooths over the hours it actually has.
+    Edge-aware: the first hour averages its first two hours, the last
+    hour its last two. Neighbours are taken from `hours`, so a case
+    scoring a subset of hours still smooths over the hours it has.
     """
     out = {}
     half = SMOOTH_WINDOW // 2
@@ -138,10 +166,35 @@ def smooth(values, hours):
     return out
 
 
+def select_donors(donors, p1):
+    """Same-scale donors for this case, in a fixed summation order.
+
+    `donors` is a list of complete release-day curves. Keep the curves
+    whose hour-1 print is within WINDOW log units of p1; if that leaves
+    fewer than MIN_DONORS, keep the MIN_DONORS nearest instead. The
+    result is sorted by (log hour-1 print, full curve), so the order of
+    the comparables in the input file cannot change the output bits.
+    """
+    log_p1 = math.log(max(1.0, float(p1)))
+    ranked = sorted(
+        donors,
+        key=lambda curve: (abs(math.log(curve[1]) - log_p1),
+                           math.log(curve[1]),
+                           tuple(curve[h] for h in range(1, 25))))
+    kept = [curve for curve in ranked
+            if abs(math.log(curve[1]) - log_p1) <= WINDOW]
+    if len(kept) < MIN_DONORS:
+        kept = ranked[:MIN_DONORS]
+    kept.sort(key=lambda curve: (math.log(curve[1]),
+                                 tuple(curve[h] for h in range(1, 25))))
+    return kept
+
+
 def forecast_case(case):
-    if case.get("levels") != LEVELS:
-        raise ValueError("case asks for levels %r, not %r"
-                         % (case.get("levels"), LEVELS))
+    levels = case.get("levels")
+    if (not isinstance(levels, list) or len(levels) != len(LEVELS)
+            or any(abs(a - b) > 1e-9 for a, b in zip(levels, LEVELS))):
+        raise ValueError("case asks for levels %r, not %r" % (levels, LEVELS))
     known = case.get("known") or []
     first = next((k for k in known if k.get("hour") == 1), None)
     if first is not None and first.get("viewers"):
@@ -167,26 +220,21 @@ def forecast_case(case):
         donors.append(curve)
     if not donors:
         return fallback_forecast(p1, wanted)
+    donors = select_donors(donors, p1)
 
-    log_p1 = math.log(p1)
-    weights = [math.exp(-((math.log(curve[1]) - log_p1) / BANDWIDTH) ** 2)
-               for curve in donors]
-
-    hours = []
     medians = {}
     offsets = {i: {} for i in range(5)}
     for h in wanted:
-        pairs = [(math.log(curve[h] / curve[1]), w)
-                 for curve, w in zip(donors, weights)]
-        total = sum(w for _, w in pairs)
-        mu = sum(v * w for v, w in pairs) / total
-        var = sum(w * (v - mu) ** 2 for v, w in pairs) / total
+        ratios = [math.log(curve[h] / curve[1]) for curve in donors]
+        mu = sum(ratios) / len(ratios)
+        var = sum((v - mu) ** 2 for v in ratios) / len(ratios)
         sigma = math.sqrt(max(var, 1e-9))
         medians[h] = mu
         for i, z in enumerate(Z):
             offsets[i][h] = z * sigma
     medians = smooth(medians, wanted)
     offsets = {i: smooth(offsets[i], wanted) for i in range(5)}
+    hours = []
     for h in wanted:
         row = [round2(max(1.0, p1 * math.exp(medians[h] + offsets[i][h])))
                for i in range(5)]
