@@ -1,274 +1,388 @@
-"""Forecast the rest of a launch day from its first hour.
+"""Peramal penonton Twitch di hari rilis, dari jam pertama saja.
 
-The program looks at past launches supplied with the case. For each
-past launch it reconstructs the 24 hourly counts of that launch's
-release day. A past launch is only useful when its day is fully
-observed with positive counts and its opening hour is at least 5% of
-the day's highest hour; thinner opening hours belong to launches
-whose real unlock came later, and they would mislead an
-opening-hour method.
+Gagasan utamanya: bentuk kurva sepanjang hari dipinjam dari peluncuran
+lampau yang jam pertamanya mirip. Untuk tiap peluncuran pembanding,
+diambil 24 angka jamnya di hari rilis. Pembanding yang jam pertamanya
+dekat (dalam skala log) dengan jam pertama kasus ini dipakai sebagai
+donor. Dari donor-donor itu dihitung, per jam, rata-rata dan sebaran
+dari log rasio terhadap jam pertama masing-masing donor, lalu kedua
+kurva itu dihaluskan dan dipakai untuk membentuk lima kuantil di
+sekitar angka jam pertama kasus ini. Bila tidak ada donor yang layak,
+ramalan jatuh ke bentuk datar dengan sebaran yang melebar mengikuti
+akar waktu, seperti acuan dasar kompetisi.
 
-Useful launches are then compared by opening scale. Those whose
-opening count is within 1.55 log units of the current case's opening
-count are averaged with equal weight. If fewer than 6 launches fall
-in that band, the 6 nearest in opening scale are averaged instead,
-so the result never depends on one or two histories.
-
-For each later hour, the averaged launches give log ratios of that
-hour to the opening hour. Their average and population spread feed
-a lognormal quantile formula scaled by the current opening count.
-The average curve and every spread curve are passed through a
-centred 3-hour average that adapts at the ends, keeping single-hour
-noise from bending one row.
-
-If no launch qualifies, the program falls back to holding the
-opening count flat with a widening spread. If the opening count
-itself is absent, the latest history point stands in for it. The
-computation uses a fixed donor order, ignores fields it does not
-need, and uses no randomness, clock, or network, so two runs on
-the same input produce the same bytes. Only the standard library
-is used.
-
-End-to-end verification on held-out case files, running this
-program as a subprocess: mean pinball loss 0.2541 across 29
-launches and 0.2072 across the 16 largest, versus 0.2638 / 0.2125
-for the Gaussian-kernel method. Determinism, permutation
-invariance, extra final-case fields, and six edge cases pass.
+Hanya standard library yang dipakai. Tidak ada keacakan, tidak ada
+pembacaan jam sistem, tidak ada jaringan, dan urutan donor selalu
+diurutkan dengan kunci yang sama, sehingga dua jalan pada kasus yang
+sama selalu menulis berkas yang sama.
 """
 
 import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# With -P the grader leaves this directory off sys.path; add it back
-# so that modules sitting next to this file remain importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_lokasi_berkas_ini = Path(__file__).resolve()
+_direktori_berkas_ini = str(_lokasi_berkas_ini.parent)
+if _direktori_berkas_ini not in sys.path:
+    sys.path.insert(0, _direktori_berkas_ini)
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+# Level kuantil yang diminta kasus, sesuai urutan di tiap baris keluaran.
+LEVEL_YANG_DITAGIH = (0.05, 0.25, 0.5, 0.75, 0.95)
+# Kuantil sebaran normal baku pada tiap level, dari yang paling rendah.
+AMBANG_NORMAL = (
+    -1.6448536269514722,
+    -0.6744897501960817,
+    0.0,
+    0.6744897501960817,
+    1.6448536269514722,
+)
+SELISIH_LEVEL_DIIZINKAN = 1e-9
+JARAK_LOG_MAKSIMAL = 1.55
+DONOR_PALING_SEDIKIT = 6
+JAM_DALAM_SEHARI = 24
+BATAS_BAWAH_VARIANS = 1e-9
+SEBARAN_PER_AKAR_JAM = 0.15
+RASIO_AWAL_MINIMAL = 0.05
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-NORMAL_QUANTILES = [-1.6448536269514722, -0.6744897501960817, 0.0,
-                    0.6744897501960817, 1.6448536269514722]
 
-# Donors must lie within this log distance of the opening count.
-WINDOW = 1.55
-# Donor set is topped up to this size from the nearest launches.
-MIN_DONORS = 6
-# A donor's opening hour must reach this fraction of its day peak.
-PEAK_FRACTION_MIN = 0.05
-# How fast the flat fallback's spread grows with the horizon.
-FALLBACK_SPREAD = 0.15
-# Smallest variance allowed, keeping unanimous donors non-degenerate.
-VAR_FLOOR = 1e-9
+def angka_yang_bisa_dipakai(nilai):
+    """Ubah nilai menjadi bilangan positif, atau kembalikan None.
 
-
-def half_up_2dp(x):
-    """Round a positive value to 2 decimals, halves rounding up.
-
-    Values that land exactly on a whole number are returned as int.
+    Yang diterima hanya bilangan biasa dan string yang isinya bilangan.
+    Boolean, nilai kosong, dan bilangan yang tidak hingga atau tidak
+    positif ditolak, karena logaritmanya tidak terdefinisi.
     """
-    hundredths = x * 100.0
-    floored = math.floor(hundredths)
-    if hundredths - floored >= 0.5:
-        floored += 1
-    result = floored / 100.0
-    return int(result) if result.is_integer() else result
-
-
-def read_instant(text):
-    """Turn ISO-8601 text into an instant, or None if it fails."""
-    if not isinstance(text, str):
+    if nilai is None or isinstance(nilai, bool):
         return None
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def to_positive(value):
-    """Interpret value as a positive float, else None.
-
-    Plain numbers and numeric strings count; booleans, nulls, and
-    values that are not positive do not, so corrupt rows are skipped.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str):
+    if isinstance(nilai, (int, float)):
+        hasil = float(nilai)
+    elif isinstance(nilai, str):
+        tulisan = nilai.strip()
+        if not tulisan:
+            return None
         try:
-            number = float(value)
+            hasil = float(tulisan)
         except ValueError:
             return None
     else:
         return None
-    return number if number > 0 else None
+    if not math.isfinite(hasil) or hasil <= 0:
+        return None
+    return hasil
 
 
-def extract_curve(entry):
-    """Pull a 24-hour release-day curve out of a comparable, or None.
+def baca_waktu_iso(tulisan):
+    """Ubah tulisan waktu ISO-8601 menjadi datetime, atau None bila rusak.
 
-    Hourly rows are bucketed by whole hours elapsed since the entry's
-    day_start. A curve is returned only when all 24 buckets contain
-    a positive count.
+    Waktu tanpa keterangan zona dianggap waktu UTC, supaya baris yang
+    hanya menulis tanggal dan jam tetap bisa dipakai.
     """
-    if not isinstance(entry, dict):
+    if not isinstance(tulisan, str):
         return None
-    day_start = read_instant(entry.get("day_start"))
-    if day_start is None:
+    potongan = tulisan.strip()
+    if not potongan:
         return None
+    if potongan[-1] in ("Z", "z"):
+        potongan = potongan[:-1] + "+00:00"
     try:
-        rows = list(entry.get("hourly") or [])
-    except TypeError:
+        momen = datetime.fromisoformat(potongan)
+    except ValueError:
         return None
-    curve = [None] * 24
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        when = read_instant(row.get("from"))
-        viewers = to_positive(row.get("viewers"))
-        if when is None or viewers is None:
-            continue
-        hour = int((when - day_start).total_seconds() // 3600) + 1
-        if 1 <= hour <= 24:
-            curve[hour - 1] = viewers
-    if any(v is None for v in curve) or curve[0] <= 0:
+    if momen.tzinfo is None:
+        momen = momen.replace(tzinfo=timezone.utc)
+    return momen
+
+
+def nomor_jam_baris(baris):
+    """Ambil nomor jam bulat dari sebuah baris, atau None bila tidak ada."""
+    if not isinstance(baris, dict):
         return None
-    return curve
+    mentah = baris.get("hour")
+    if mentah is None or isinstance(mentah, bool):
+        return None
+    if isinstance(mentah, (int, float)):
+        angka = float(mentah)
+    elif isinstance(mentah, str):
+        try:
+            angka = float(mentah.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(angka):
+        return None
+    bulat = int(angka)
+    if float(bulat) != angka:
+        return None
+    return bulat
 
 
-def order_key(curve):
-    """Deterministic ordering: log opening count, then the curve."""
-    return (math.log(curve[0]), tuple(curve))
+def bulatkan_setengah_ke_atas(nilai):
+    """Bulatkan ke 2 desimal, pecahan tepat setengah naik ke atas.
 
-
-def select_donors(curves, p1):
-    """Pick the donors for one case, in deterministic sum order.
-
-    Curves within the log window around p1 are taken; if too few
-    qualify, the closest curves make up the numbers. The chosen
-    curves are returned in deterministic order, so shuffling the
-    input cannot change the sums.
+    Hasil yang kebetulan bulat dikembalikan sebagai bilangan bulat,
+    supaya penulisannya di JSON sama seperti bilangan bulat biasa.
     """
-    log_p1 = math.log(max(1.0, float(p1)))
-    by_distance = sorted(
-        curves,
-        key=lambda c: (abs(math.log(c[0]) - log_p1), order_key(c)))
-    kept = [c for c in by_distance
-            if abs(math.log(c[0]) - log_p1) <= WINDOW]
-    if len(kept) < MIN_DONORS:
-        kept = by_distance[:MIN_DONORS]
-    return sorted(kept, key=order_key)
+    dalam_seratus = nilai * 100.0
+    terbulat = math.floor(dalam_seratus + 0.5)
+    kembali = terbulat / 100.0
+    sebagai_bulat = int(kembali)
+    if kembali == sebagai_bulat:
+        return sebagai_bulat
+    return kembali
 
 
-def smooth_centered(values, hours):
-    """Average each hour with its present neighbours (3-point, centred).
+def pangkat_terkendali(pangkat):
+    """Eksponen dengan pangkat yang dibatasi, supaya tidak pernah meluap.
 
-    Hours at the ends of the requested range average over the two
-    hours available; every other hour averages over three.
+    Rasio donor dari data normal memberi pangkat puluhan saja, jauh
+    dari batas ini, sehingga pembatasan tidak mengubah ramalan normal
+    sama sekali. Ia hanya menjaga program dari crash bila kurva
+    sampah membawa rasio ekstrem.
     """
-    present = set(hours)
-    out = {}
-    for h in hours:
-        neighbours = [values[k] for k in (h - 1, h, h + 1) if k in present]
-        out[h] = sum(neighbours) / len(neighbours)
-    return out
+    if pangkat > 700.0:
+        pangkat = 700.0
+    elif pangkat < -700.0:
+        pangkat = -700.0
+    return math.exp(pangkat)
 
 
-def persist_forecast(p1, hours):
-    """Flat fallback: each hour repeats the opening count."""
-    p1 = max(1.0, float(p1))
-    rows = []
-    for h in hours:
-        spread = FALLBACK_SPREAD * math.sqrt(h - 1)
-        rows.append({"hour": h,
-                     "q": [half_up_2dp(p1 * math.exp(z * spread))
-                           for z in NORMAL_QUANTILES]})
-    return {"hours": rows}
+def haluskan_tiga_titik(deret):
+    """Rata-rata bergerak 3 titik yang berpusat, sadar tepi.
+
+    Titik ujung hanya punya satu tetangga, jadi diratakan atas dua
+    angka; titik tengah diratakan atas tiga angka.
+    """
+    banyak = len(deret)
+    keluaran = []
+    for posisi in range(banyak):
+        mulai = posisi - 1
+        if mulai < 0:
+            mulai = 0
+        selesai = posisi + 2
+        if selesai > banyak:
+            selesai = banyak
+        jendela = deret[mulai:selesai]
+        keluaran.append(sum(jendela) / len(jendela))
+    return keluaran
 
 
-def hour_one(case):
-    """Find the opening count, falling back through history if needed."""
-    known = case.get("known") or []
-    for row in known:
-        if not isinstance(row, dict) or row.get("hour") != 1:
-            continue
-        viewers = to_positive(row.get("viewers"))
-        if viewers is not None:
-            return max(1.0, viewers)
-    history = case.get("history") or []
-    for row in reversed(history):
-        if not isinstance(row, dict):
-            continue
-        viewers = to_positive(row.get("viewers"))
-        if viewers is not None:
-            return max(1.0, viewers)
+def pastikan_level_sesuai(kasus, nama_berkas):
+    """Gagalkan kasus bila daftar levelnya bukan lima nilai yang ditagih."""
+    diminta = kasus.get("levels")
+    if not isinstance(diminta, list) or len(diminta) != len(LEVEL_YANG_DITAGIH):
+        raise ValueError(f"{nama_berkas} levelnya bukan lima nilai yang ditagih")
+    for dapat, patokan in zip(diminta, LEVEL_YANG_DITAGIH):
+        if dapat is None or isinstance(dapat, bool):
+            raise ValueError(f"{nama_berkas} levelnya bukan lima nilai yang ditagih")
+        try:
+            if isinstance(dapat, str):
+                angka = float(dapat.strip())
+            else:
+                angka = float(dapat)
+        except (TypeError, ValueError):
+            raise ValueError(f"{nama_berkas} levelnya bukan lima nilai yang ditagih")
+        if not math.isfinite(angka) or abs(angka - patokan) > SELISIH_LEVEL_DIIZINKAN:
+            raise ValueError(f"{nama_berkas} levelnya bukan lima nilai yang ditagih")
+
+
+def cari_angka_jam_pertama(kasus):
+    """Cari angka jam pertama: baris known jam 1, lalu history terakhir.
+
+    Bila tidak satu pun baris memberi angka yang bisa dipakai, dipakai
+    angka 1 sebagai jalan terakhir.
+    """
+    dikenal = kasus.get("known")
+    if isinstance(dikenal, list):
+        for baris in dikenal:
+            if nomor_jam_baris(baris) != 1:
+                continue
+            angka = angka_yang_bisa_dipakai(baris.get("viewers"))
+            if angka is not None:
+                return angka
+    riwayat = kasus.get("history")
+    if isinstance(riwayat, list):
+        for baris in reversed(riwayat):
+            if not isinstance(baris, dict):
+                continue
+            angka = angka_yang_bisa_dipakai(baris.get("viewers"))
+            if angka is not None:
+                return angka
     return 1.0
 
 
-def make_forecast(case):
-    levels = case.get("levels")
-    if (not isinstance(levels, list) or len(levels) != len(LEVELS)
-            or any(abs(a - b) > 1e-9 for a, b in zip(levels, LEVELS))):
-        raise ValueError("case levels do not match the expected levels: %r"
-                         % (levels,))
-    p1 = hour_one(case)
+def susun_kurva_harian(pembanding):
+    """Susun 24 angka jam hari rilis dari satu peluncuran pembanding.
 
-    wanted = set()
-    for row in case.get("forecast") or []:
-        if isinstance(row, dict):
-            hour = row.get("hour")
-            if isinstance(hour, int) and not isinstance(hour, bool):
-                wanted.add(hour)
-    wanted = sorted(h for h in wanted if 2 <= h <= 24) or list(range(2, 25))
-
-    donors = []
-    for comp in case.get("comparables") or []:
-        curve = extract_curve(comp)
-        if curve is None:
+    Baris dikelompokkan ke ember jam menurut selisih jam bulat (ke
+    bawah) dari awal hari pembanding; ember 0 adalah jam pertama.
+    Baris yang waktunya atau angkanya rusak dilewati. Kurva dianggap
+    sah hanya bila ke-24 ember terisi dan angka jam pertamanya tidak
+    kurang dari 5% angka terbesar kurva itu.
+    """
+    if not isinstance(pembanding, dict):
+        return None
+    awal_hari = baca_waktu_iso(pembanding.get("day_start"))
+    if awal_hari is None:
+        return None
+    per_jam = pembanding.get("hourly")
+    if not isinstance(per_jam, list):
+        return None
+    ember = [None] * JAM_DALAM_SEHARI
+    langkah = timedelta(hours=1)
+    for baris in per_jam:
+        if not isinstance(baris, dict):
             continue
-        if curve[0] / max(curve) < PEAK_FRACTION_MIN:
+        momen = baca_waktu_iso(baris.get("from"))
+        if momen is None:
             continue
-        donors.append(curve)
-    if not donors:
-        return persist_forecast(p1, wanted)
-    donors = select_donors(donors, p1)
-
-    mus = {}
-    offsets = {i: {} for i in range(len(NORMAL_QUANTILES))}
-    for h in wanted:
-        ratios = [math.log(curve[h - 1] / curve[0]) for curve in donors]
-        mu = sum(ratios) / len(ratios)
-        var = sum((r - mu) ** 2 for r in ratios) / len(ratios)
-        sigma = math.sqrt(max(var, VAR_FLOOR))
-        mus[h] = mu
-        for i, z in enumerate(NORMAL_QUANTILES):
-            offsets[i][h] = z * sigma
-    mus = smooth_centered(mus, wanted)
-    offsets = {i: smooth_centered(offsets[i], wanted) for i in offsets}
-    rows = []
-    for h in wanted:
-        quantiles = [half_up_2dp(max(1.0, p1 * math.exp(mus[h] + offsets[i][h])))
-                     for i in range(len(NORMAL_QUANTILES))]
-        for i in range(1, len(quantiles)):
-            quantiles[i] = max(quantiles[i], quantiles[i - 1])
-        rows.append({"hour": h, "q": quantiles})
-    return {"hours": rows}
+        angka = angka_yang_bisa_dipakai(baris.get("viewers"))
+        if angka is None:
+            continue
+        posisi = (momen - awal_hari) // langkah
+        if 0 <= posisi < JAM_DALAM_SEHARI and ember[posisi] is None:
+            ember[posisi] = angka
+    if any(slot is None for slot in ember):
+        return None
+    kurva = [float(slot) for slot in ember]
+    if kurva[0] / max(kurva) < RASIO_AWAL_MINIMAL:
+        return None
+    return kurva
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        result = make_forecast(case)
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(result, separators=(",", ":")) + "\n",
-            encoding="utf-8")
+def tentukan_donor(semua_kurva, patokan):
+    """Pilih donor dari kurva-kurva sah, dengan urutan yang tetap.
+
+    Kurva yang jarak log jam pertamanya dari patokan tidak melebihi
+    batas dipakai semua. Bila yang lolos kurang dari enam, dipakai
+    enam kurva terdekat, dengan seri jarak dipecah oleh kunci urut
+    yang sama. Donor terpilih lalu diurutkan berdasarkan log angka
+    jam pertama, kemudian seluruh isi kurva, sebelum dipakai, supaya
+    urutan pembanding di dalam kasus tidak mengubah hasil.
+    """
+    if not semua_kurva:
+        return []
+    log_patokan = math.log(patokan)
+    calon = []
+    for kurva in semua_kurva:
+        log_awal = math.log(kurva[0])
+        jarak = abs(log_awal - log_patokan)
+        calon.append((jarak, log_awal, tuple(kurva), kurva))
+    lolos = [butir for butir in calon if butir[0] <= JARAK_LOG_MAKSIMAL]
+    if len(lolos) >= DONOR_PALING_SEDIKIT:
+        terpilih = lolos
+    else:
+        berdasarkan_jarak = sorted(calon, key=lambda butir: (butir[0], butir[1], butir[2]))
+        terpilih = berdasarkan_jarak[:DONOR_PALING_SEDIKIT]
+    terpilih.sort(key=lambda butir: (butir[1], butir[2]))
+    return [butir[3] for butir in terpilih]
+
+
+def baris_ramalan_datar(patokan, jam):
+    """Ramalan datar untuk satu jam: tetap di patokan, sebaran melebar."""
+    jarak_dari_awal = jam - 1
+    if jarak_dari_awal < 0:
+        jarak_dari_awal = 0
+    sebaran = SEBARAN_PER_AKAR_JAM * math.sqrt(jarak_dari_awal)
+    kuantil = []
+    for ambang in AMBANG_NORMAL:
+        mentah = patokan * pangkat_terkendali(ambang * sebaran)
+        kuantil.append(bulatkan_setengah_ke_atas(mentah))
+    return {"hour": jam, "q": kuantil}
+
+
+def ramalkan_satu_kasus(kasus, nama_berkas):
+    """Bentuk ramalan lengkap untuk satu kasus."""
+    if not isinstance(kasus, dict):
+        raise ValueError(f"{nama_berkas} bukan objek kasus")
+    pastikan_level_sesuai(kasus, nama_berkas)
+    angka_awal = cari_angka_jam_pertama(kasus)
+    patokan = angka_awal if angka_awal >= 1.0 else 1.0
+
+    jam_yang_diminta = []
+    daftar_ramal = kasus.get("forecast")
+    if isinstance(daftar_ramal, list):
+        for baris in daftar_ramal:
+            jam = nomor_jam_baris(baris)
+            if jam is not None:
+                jam_yang_diminta.append(jam)
+    jam_yang_diminta.sort()
+
+    kurva_sah = []
+    daftar_pembanding = kasus.get("comparables")
+    if isinstance(daftar_pembanding, list):
+        for pembanding in daftar_pembanding:
+            kurva = susun_kurva_harian(pembanding)
+            if kurva is not None:
+                kurva_sah.append(kurva)
+    donor = tentukan_donor(kurva_sah, patokan)
+
+    if not donor:
+        baris = [baris_ramalan_datar(patokan, jam) for jam in jam_yang_diminta]
+        return {"hours": baris}
+
+    banyak_donor = len(donor)
+    daftar_tengah = []
+    daftar_sebar = []
+    for jam in jam_yang_diminta:
+        posisi = jam - 1
+        if 0 <= posisi < JAM_DALAM_SEHARI:
+            rasio_log = []
+            for kurva in donor:
+                rasio_log.append(math.log(kurva[posisi] / kurva[0]))
+            tengah = sum(rasio_log) / banyak_donor
+            jumlah_kuadrat = sum((nilai - tengah) ** 2 for nilai in rasio_log)
+            varians = jumlah_kuadrat / banyak_donor
+            if varians < BATAS_BAWAH_VARIANS:
+                varians = BATAS_BAWAH_VARIANS
+            daftar_tengah.append(tengah)
+            daftar_sebar.append(math.sqrt(varians))
+        else:
+            # Jam di luar jangkauan kurva harian tidak punya rasio donor;
+            # perlakukan sebagai jam datar supaya barisnya tetap terisi.
+            daftar_tengah.append(0.0)
+            jarak_dari_awal = jam - 1
+            if jarak_dari_awal < 0:
+                jarak_dari_awal = 0
+            daftar_sebar.append(SEBARAN_PER_AKAR_JAM * math.sqrt(jarak_dari_awal))
+
+    tengah_halus = haluskan_tiga_titik(daftar_tengah)
+    geser_halus = []
+    for ambang in AMBANG_NORMAL:
+        geser_mentah = [ambang * sebar for sebar in daftar_sebar]
+        geser_halus.append(haluskan_tiga_titik(geser_mentah))
+
+    baris = []
+    for urutan, jam in enumerate(jam_yang_diminta):
+        kuantil = []
+        for tingkat in range(len(AMBANG_NORMAL)):
+            mentah = patokan * pangkat_terkendali(tengah_halus[urutan] + geser_halus[tingkat][urutan])
+            if mentah < 1.0:
+                mentah = 1.0
+            kuantil.append(bulatkan_setengah_ke_atas(mentah))
+        for tingkat in range(1, len(kuantil)):
+            if kuantil[tingkat] < kuantil[tingkat - 1]:
+                kuantil[tingkat] = kuantil[tingkat - 1]
+        baris.append({"hour": jam, "q": kuantil})
+    return {"hours": baris}
+
+
+def jalankan():
+    """Proses tiap berkas kasus di direktori masukan, tulis keluarannya."""
+    direktori_masuk = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+    direktori_keluar = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    direktori_keluar.mkdir(parents=True, exist_ok=True)
+    berkas_kasus = sorted(direktori_masuk.glob("*.in"), key=lambda berkas: berkas.name)
+    for berkas in berkas_kasus:
+        kasus = json.loads(berkas.read_text(encoding="utf-8"))
+        hasil = ramalkan_satu_kasus(kasus, berkas.name)
+        tulisan = json.dumps(hasil, separators=(",", ":")) + "\n"
+        tujuan = direktori_keluar / (berkas.stem + ".out")
+        tujuan.write_text(tulisan, encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main()
+    jalankan()
